@@ -1,16 +1,32 @@
 import os
+
+from huggingface_hub import list_repo_refs
+
 os.environ['KMP_DUPLICATE_LIB_OK']='TRUE'
 import torch
 import torch.optim as optim
 import time
-
+import math
 
 import config
 from model import LanguageModel
 from data_utils import load_data_and_prepare, get_batch
 from plot_utils import plot_losses, plot_lm_loss_comparison
 
+def get_lr(it):
+    #实现Warm up+Consine Decay
+    #线性预热
+    if it<config.WARMUP_ITERS:
+        return config.LEARNING_RATE*it/config.WARMUP_ITERS
+    #迭代次数超过衰减周期，减少最小学习率
+    if it>config.LR_DECAY_ITERS:
+        return config.MIN_LR
 
+    #余弦退火
+    decay_ratio=(it-config.WARMUP_ITERS)/(config.LR_DECAY_ITERS-config.WARMUP_ITERS)
+    assert 0<=decay_ratio<=1
+    coeff=0.5*(1.0+math.cos(math.pi*decay_ratio))#从1变化成0
+    return config.MIN_LR+coeff*(config.LEARNING_RATE-config.MIN_LR)
 def run_experiment(exp_config):
     #更新全局配置
     config.TOKENIZER_TYPE=exp_config['tokenizer_type']
@@ -26,12 +42,12 @@ def run_experiment(exp_config):
     print(f"模型参量:{sum(p.numel() for p in model.parameters())/1e6:2f}M")
 
     #优化器
-    optimizer=optim.AdamW(model.parameters(), lr=config.LEARNING_RATE)
+    optimizer=optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
 
     #训练村换
     val_losses=[]
     eval_iters_list=[]
-
+    all_lrs=[]
     @torch.no_grad()
     def estimate_loss():
         out={}
@@ -48,18 +64,24 @@ def run_experiment(exp_config):
 
     print("开始训练")
     start_time=time.time()
-    for iter_num in range(config.EPOCHS):
+    for iter_num in range(config.MAX_ITERS):
+
+        lr=get_lr(iter_num)
+        for param_group in optimizer.param_groups:
+            param_group['lr']=lr
+        all_lrs.append(lr)
         xb, yb=get_batch('train', train_data, val_data)
         _, loss=model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)#加入梯度裁剪
         optimizer.step()
 
-        if iter_num%config.EVAL_INTERVAL==0 or iter_num==config.EPOCHS-1:
+        if iter_num%config.EVAL_INTERVAL==0 or iter_num==config.MAX_ITERS-1:
             losses=estimate_loss()
             val_losses.append(losses['val'])
             eval_iters_list.append(iter_num)
-            print(f"迭代 {iter_num}/{config.EPOCHS} | 训练损失: {losses['train']:.4f} | 验证损失: {losses['val']:.4f} | 耗时: {time.time() - start_time:.2f}s")
+            print(f"迭代 {iter_num}/{config.MAX_ITERS} | 训练损失: {losses['train']:.4f} | 验证损失: {losses['val']:.4f} | 耗时: {time.time() - start_time:.2f}s")
             start_time = time.time()
 
     print("训练完成")

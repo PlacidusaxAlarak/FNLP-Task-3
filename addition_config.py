@@ -1,17 +1,18 @@
 import torch
 
 from config import MAX_NEW_TOKENS
-
-VOCAB="0123456789+=\n"
+PAD_TOKEN="_"
+VOCAB=f"0123456789+=\n{PAD_TOKEN}"
 VOCAB_SIZE=len(VOCAB)
+PAD_TOKEN_ID=tuple(VOCAB).index(PAD_TOKEN)
 
 #模型架构配置
 BLOCK_SIZE=32
 D_MODEL=256
-N_HEADS=8
-N_LAYERS=8
-DROPOUT=0.5
-WEIGHT_DEACY=0.1
+N_HEADS=16
+N_LAYERS=10
+DROPOUT=0.1
+WEIGHT_DEACY=0.01
 #训练配置
 BATCH_SIZE=256
 LEARNING_RATE=1e-3
@@ -22,6 +23,3 @@ MAX_NEW_TOKENS=10
 #推理评估配置
 MODEL_SAVE_PATH="models/addition_transformer.pth"
 PLOT_SAVE_PATH="plots/addition_loss_curve.png"
-
-print(f"设备: {DEVICE}")
-print(f"词汇表大小:{VOCAB_SIZE}")

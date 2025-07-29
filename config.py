@@ -10,16 +10,22 @@ MODEL_TYPE='decoder-only'
 BLOCK_SIZE=128
 D_MODEL=384
 N_HEADS=6
-N_LAYERS=6
-DROPOUT=0.5
+N_LAYERS=8
+DROPOUT=0.1
 
 #训练配置
 BATCH_SIZE=64
 LEARNING_RATE=3e-4
 EPOCHS=5000
+MAX_ITERS=20000
+WEIGHT_DECAY=0.01
 EVAL_INTERVAL=250#每N词迭代，进行一次验证
 DEVICE='cuda' if torch.cuda.is_available() else 'cpu'
 
+#新增：学习率调度器配置
+WARMUP_ITERS=200#预热的迭代次数
+MIN_LR=3e-5#学习率退火后的最小值
+LR_DECAY_ITERS=MAX_ITERS#学习率衰减的总迭代次数
 #推理配置
 MAX_NEW_TOKENS=500#生成文本的最大长度
 

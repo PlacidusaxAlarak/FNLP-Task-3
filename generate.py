@@ -45,7 +45,7 @@ def main():
         context=torch.tensor(context_tokens, dtype=torch.long, device=config.DEVICE).unsqueeze(0)
 
         with torch.no_grad():
-            generated_tokens=model.generate(context, max_new_tokens=config.MAX_NEW_TOKENS)[0].tolist()
+            generated_tokens=model.generate(context, max_new_tokens=config.MAX_NEW_TOKENS, temperature=0.7, top_k=None, top_p=0.9)[0].tolist()
 
         generated_text=tokenizer.decode(generated_tokens)
         print("\n" + "--- " + f"'{exp_conf['name']}' 的生成结果" + " ---")

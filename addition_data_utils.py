@@ -17,11 +17,16 @@ class MathTokenizer:
         return ''.join([self.itos[i] for i in l])
 
 
-def generate_addition_problem(num_digits1, num_digits2):
+def generate_addition_problem(num_digits1, num_digits2, max_digits=4):
     n1=random.randint(0, 10**num_digits1-1)
     n2=random.randint(0, 10**num_digits2-1)
     sum_val=n1+n2
-    problem=f"{n1}+{n2}={sum_val}\n"
+    sum_rev=str(sum_val)[::-1]
+    #使用PAD_TOKEN进行左对齐填充
+    s1_padded=str(n1).rjust(max_digits, config.PAD_TOKEN)
+    s2_padded=str(n2).rjust(max_digits, config.PAD_TOKEN)
+    sum_rev_padded=sum_rev.ljust(max_digits + 1, config.PAD_TOKEN)
+    problem=f"{s1_padded}+{s2_padded}={sum_rev_padded}\n"
     return problem
 
 def generate_dataset(num_samples, allowed_digit_pairs):

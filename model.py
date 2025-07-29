@@ -4,22 +4,46 @@ from torch.nn import functional as F
 import math
 import config
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=config.DROPOUT, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        self.dropout=nn.Dropout(p=dropout)
 
-        pe=torch.zeros(max_len, d_model)
-        position=torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term=torch.exp(torch.arange(0, d_model, 2).float()*(-math.log(10000.0)/d_model))
-        pe[:, 0::2]=torch.sin(position*div_term)
-        pe[:, 1::2]=torch.cos(position*div_term)
-        pe=pe.unsqueeze(0)
-        self.register_buffer('pe', pe)#注册非参数张量缓存区
 
-    def forward(self, x):
-        x=x+self.pe[:, :x.size(1)]
-        return self.dropout(x)
+class Block(nn.Module):
+    #使用Pre-LN架构
+    def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
+        assert d_model%n_heads==0
+
+        #层归一化
+        self.ln1=nn.LayerNorm(d_model)
+        self.ln2=nn.LayerNorm(d_model)
+
+        #多头自注意力机制
+        self.attn=nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        #前馈神经网络
+        self.ffn=nn.Sequential(
+            nn.Linear(d_model, 4*d_model),
+            nn.GELU(),
+            nn.Linear(4*d_model, d_model),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x:torch.Tensor, attn_mask:torch.Tensor)->torch.Tensor:
+        #Pre_LN
+        x_norm1=self.ln1(x)
+        attn_output, _=self.attn(x_norm1, x_norm1, x_norm1, attn_mask=attn_mask, is_causal=False)
+        x=x+attn_output
+
+        #前馈神经网络
+        x_norm2=self.ln2(x)
+        x=x+self.ffn(x_norm2)
+
+        return x
+
 
 class LanguageModel(nn.Module):
     def __init__(self):
@@ -28,24 +52,21 @@ class LanguageModel(nn.Module):
         assert config.D_MODEL%config.N_HEADS==0
 
         self.token_embedding_table=nn.Embedding(config.VOCAB_SIZE, config.D_MODEL)
-        self.positional_encoding=PositionalEncoding(config.D_MODEL, config.DROPOUT, config.BLOCK_SIZE)
-
-        #PyTorch标准的TransformerDecoderLayer
-        decoder_layer=nn.TransformerDecoderLayer(
-            d_model=config.D_MODEL,
-            nhead=config.N_HEADS,
-            dim_feedforward=4*config.D_MODEL,
-            dropout=config.DROPOUT,
-            batch_first=True
+        self.position_embedding_table=nn.Embedding(config.BLOCK_SIZE, config.D_MODEL)
+        self.dropout=nn.Dropout(config.DROPOUT)
+        self.blocks=nn.ModuleList(
+            [Block(config.D_MODEL, config.N_HEADS, config.DROPOUT) for _ in range(config.N_LAYERS)]
         )
 
-        self.trainformer_decoder=nn.TransformerDecoder(
-            decoder_layer,
-            num_layers=config.N_LAYERS,
-            norm=nn.LayerNorm(config.D_MODEL)
-        )
+        #解码器最后的层归一化
+        self.ln_f=nn.LayerNorm(config.D_MODEL)
 
-        self.lm_head=nn.Linear(config.D_MODEL, config.VOCAB_SIZE)
+        #最终的线性层(语言模型头)
+        self.lm_head=nn.Linear(config.D_MODEL, config.VOCAB_SIZE, bias=False)
+
+        #权重绑定
+        self.token_embedding_table.weight=self.lm_head.weight#两者在空间上高度一致
+
 
         #初始化权重
         self.apply(self._init_weights)#对所有子模块进行_init_weights方法
@@ -66,42 +87,73 @@ class LanguageModel(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T=idx.shape
-
+        assert T<=config.BLOCK_SIZE, f"输入序列长度({T})超过了BLOCK_SIZE({config.BLOCK_SIZE})"
         #Token ans Position EMbedding
+
         tok_emb=self.token_embedding_table(idx)#(B, T, D_MODEL)
-        x=self.positional_encoding(tok_emb)#(B, T, D_MODEL)
+
+        pos=torch.arange(0, T, dtype=torch.long, device=config.DEVICE)
+        pos_emb=self.position_embedding_table(pos)#(T, D_MODEL)
+
+        x=self.dropout(tok_emb+pos_emb)
 
         #Casual Mask
-        tgt_mask=self._generate_square_subsequent_mask(T)
+        attn_mask=self._generate_square_subsequent_mask(T)
 
-        #Decoder
-        output=self.trainformer_decoder(tgt=x, memory=x, tgt_mask=tgt_mask, memory_mask=tgt_mask)
+        for block in self.blocks:
+            x=block(x, attn_mask)
 
-        #Linear Layer
-        logits=self.lm_head(output)#(B, T, VOCAB_SIZE)
+        #最终的LN层
+        x=self.ln_f(x)
 
-        #Loss Calculation
+        logits=self.lm_head(x)
+
         loss=None
         if targets is not None:
             B, T, C=logits.shape
             logits_view=logits.view(B*T, C)
             targets_view=targets.view(B*T)
-            loss=F.cross_entropy(logits_view, targets_view)
+            loss=F.cross_entropy(logits_view, targets_view, label_smoothing=0.1)
 
         return logits, loss
-    def generate(self, idx, max_new_tokens):
-        self.eval()
-        for _ in range(max_new_tokens):
+    def generate(self, idx:torch.Tensor, max_new_tokens:int, temperature:float=0.7, top_k:int=None, top_p:float=None):
+       self.eval()
+       for _ in range(max_new_tokens):
+           #输入裁剪到BLOCK_SIZE
             idx_cond=idx[:, -config.BLOCK_SIZE:]
 
-            logits, _=self(idx_cond)#如果实现了__call__, 则可以直接使用self
+            logits, _=self(idx_cond)
+            logits =logits[:, -1, :]
 
-            logits=logits[:, -1, :]#只取最后一个时间步,形状为[batch_size, vocab_size]
+            if temperature!=1.0:
+                logits/=temperature
+
+            if top_k is not None:
+                v, _=torch.topk(logits, min(top_k, logits.size(-1)))
+                #所有低于低k个单词概率的logits都置为负无穷
+                logits[logits<v[:, [-1]]]=-float('-inf')
 
             probs=F.softmax(logits, dim=-1)
 
-            idx_next=torch.multinomial(probs, num_samples=1)#随机性
+            if top_p is not None:
+               sorted_probs, sorted_indices=torch.sort(probs, descending=True)
+               cumulative_probs=torch.cumsum(sorted_probs, dim=-1)#计算累计概率
 
-            idx=torch.cat((idx, idx_next), dim=1)#拼接
-        self.train()
-        return idx
+               sorted_indices_to_remove=cumulative_probs>top_p#找到第一个累计概率超过p的位置，并且标记此后所有的词为"待移除"
+               #至少留一个词
+               sorted_indices_to_remove[..., 1:]=sorted_indices_to_remove[..., :-1].clone()
+               sorted_indices_to_remove[..., 0]=0
+
+               #根据索引找到要移除的词，并将它们的概率设为0
+               indices_to_remove=torch.zeros_like(probs, dtype=torch.bool).scatter_(dim=1, index=sorted_indices, src=sorted_indices_to_remove)
+               probs[indices_to_remove]=0
+
+               #重新归一化
+               probs=probs/probs.sum(dim=-1, keepdim=True)
+
+            idx_next=torch.multinomial(probs, num_samples=1)#随机抽取, idx_next就是新生成的新词
+
+            idx=torch.cat((idx, idx_next), dim=1)
+
+       self.train()
+       return idx
