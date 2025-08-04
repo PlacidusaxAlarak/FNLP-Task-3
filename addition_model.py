@@ -36,7 +36,7 @@ class AdditionTransformer(nn.Module):
         self.blocks=nn.ModuleList([Block(config.D_MODEL,config.N_HEADS,config.DROPOUT) for _ in range(config.N_LAYERS)])
         self.ln_f=nn.LayerNorm(config.D_MODEL) # 解码器最后的层归一化
         self.lm_head=nn.Linear(config.D_MODEL,config.VOCAB_SIZE,bias=False)
-        # 权重绑定，一个重要的技巧
+        # 权重绑定
         self.token_embedding_table.weight=self.lm_head.weight
         # 初始化权重
         self.apply(self._init_weights)
@@ -71,21 +71,21 @@ class AdditionTransformer(nn.Module):
         logits=self.lm_head(x)
         loss=None
         if targets is not None:
-            masked_targets=targets.clone()
-            masked_targets[masked_targets==config.PAD_TOKEN_ID]=-100
-            #找到每个序列中'='的位置
-            eq_token_id=tuple(config.VOCAB).index('=')
+            # masked_targets=targets.clone()
+            # masked_targets[masked_targets==config.PAD_TOKEN_ID]=-100
+            # #找到每个序列中'='的位置
+            # eq_token_id=tuple(config.VOCAB).index('=')
 
 
-            #将'='之前所有位置的target设置为ignore_index
-            for i in range(B):
-                eq_indices=(idx[i]==eq_token_id).nonzero(as_tuple=True)[0]
-                if len(eq_indices)>0:
-                    first_eq_pos=eq_indices[0]
-                    masked_targets[i, :first_eq_pos]=-100
+            # #将'='之前所有位置的target设置为ignore_index
+            # for i in range(B):
+            #     eq_indices=(idx[i]==eq_token_id).nonzero(as_tuple=True)[0]
+            #     if len(eq_indices)>0:
+            #         first_eq_pos=eq_indices[0]
+            #         masked_targets[i, :first_eq_pos]=-100
             B,T,C=logits.shape
             logits_view=logits.view(B*T,C)
-            targets_view=masked_targets.view(B*T)
+            targets_view=targets.view(B*T)
             loss =F.cross_entropy(logits_view, targets_view, ignore_index=-100)
         return logits,loss
 

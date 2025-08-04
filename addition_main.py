@@ -8,17 +8,18 @@ import collections
 os.environ['KMP_DUPLICATE_LIB_OK']='TRUE'
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import addition_config as config
-from addition_data_utils import MathTokenizer, generate_dataset, get_batch
+from torch.utils.data import DataLoader, random_split
+from addition_data_utils import MathTokenizer, generate_dataset, AdditionDataset
 from addition_model import AdditionTransformer
 from plot_utils import plot_losses
 from plot_utils import plot_losses, plot_addition_accuracy_comparison
-def run_training(train_data, val_data, experiment_name):
+def run_training(train_loader, val_loader, experiment_name):
     print(f"\n========开始实验:{experiment_name}====")
     model=AdditionTransformer()
     model.to(config.DEVICE)
     print(f"模型参数量:{sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    optimizer=optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DEACY)
+    optimizer=optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     #定义warmup步数
     warmup_steps=int(config.TRAIN_STEPS*0.1)
     warmup_scheduler=LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps)
@@ -29,10 +30,14 @@ def run_training(train_data, val_data, experiment_name):
 
     print("开始训练")
     start_time=time.time()
+    train_iter=iter(train_loader)
     for step in range(config.TRAIN_STEPS):
-
-        xb, yb=get_batch('train', train_data, val_data)
-
+        try:
+            xb, yb=next(train_iter)
+        except StopIteration:
+            train_iter=iter(train_loader)
+            xb, yb=next(train_iter)
+        xb, yb=xb.to(config.DEVICE), yb.to(config.DEVICE)
         logits, loss=model(xb, yb)
 
         optimizer.zero_grad(set_to_none=True)#优化，不会重新分配内存
@@ -44,12 +49,12 @@ def run_training(train_data, val_data, experiment_name):
             model.eval()
             val_loss_avg=0
             with torch.no_grad():
-                for _ in range(10):
-                    x, y=get_batch('val', train_data, val_data)
-                    _, val_loss=model(x, y)
+                for val_xb, val_yb in val_loader:
+                    val_xb, val_yb=val_xb.to(config.DEVICE), val_yb.to(config.DEVICE)
+                    _, val_loss=model(val_xb, val_yb)
                     val_loss_avg+=val_loss.item()
             model.train()
-            val_loss_avg/=10
+            val_loss_avg/=len(val_loader)
             train_losses.append(loss.item())
             val_losses.append(val_loss_avg)
             eval_iters_list.append(step)
@@ -59,10 +64,23 @@ def run_training(train_data, val_data, experiment_name):
 
     print("训练完成")
 
-    os.makedirs(os.path.dirname(config.MODEL_SAVE_PATH), exist_ok=True)
-    torch.save(model.state_dict(), config.MODEL_SAVE_PATH)
-    print(f"模型已经保存至{config.MODEL_SAVE_PATH}")
+    # 1. 定义模型保存的目录路径 (这是一个字符串)
+    model_save_dir = os.path.dirname(config.MODEL_SAVE_PATH)
+    
+    # 2. 确保这个目录存在 (这个函数返回 None)
+    os.makedirs(model_save_dir, exist_ok=True)
+    
+    # 3. 清理实验名称，使其适合作为文件名
+    #    注意：这里的 .replace(" ", "_") 是为了处理原始字典中可能带空格的键
+    sanitized_name = experiment_name.replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "")
+    model_filename = f"addition_transformer_{sanitized_name}.pth"
+    
+    # 4. 使用 os.path.join 组合路径 (现在 model_save_dir 是一个字符串，所以这会正常工作)
+    final_model_path = os.path.join(model_save_dir, model_filename)
 
+    # 5. 保存模型
+    torch.save(model.state_dict(), final_model_path)
+    print(f"模型已经保存至 {final_model_path}")
     # 绘制损失曲线
     plot_losses(train_losses, val_losses, eval_iters_list,
                 title=f'Loss Curve for Experiment: {experiment_name}',
@@ -125,19 +143,41 @@ def main():
 
     tokenizer=MathTokenizer(config.VOCAB)
 
-    experiments={
-        "Standard (Interpolation/Extrapolation)":{
-            "train_pairs":[(1, 1), (1, 2), (2, 2), (2, 3), (3, 3), (3, 4)],
-            "test_pairs":[(1, 2), (1, 1), (2, 2)]
+    experiments = {
+        # --- 实验 1: 综合基准 (Comprehensive Baseline) ---
+        # 假设: 在一个覆盖1到4位数的丰富、多样化的数据集上训练，模型能够掌握所有分布内的加法组合。
+        # 这是“最佳情况”的基准。
+        "1_Comprehensive_Baseline": {
+            "train_pairs": [
+                (1, 1), (2, 2), (3, 3), (4, 4), # 对称
+                (1, 3), (2, 4), # 不对称
+            ],
+            "test_pairs":  [
+                (4, 4),      # 分布内，验证学习效果
+                (3, 4),      # 分布内，但组合未见，测试组合泛化
+            ]
         },
-        # "Hard Extrapolation":{
-        #     "train_pairs":[(1, 1), (1, 2), (2, 2)],
-        #     "test_pairs":[(3, 3), (4, 4)]
-        # },
-        # "Interpolation":{
-        #     "train_pairs":[(2, 2), (4, 4)],
-        #     "test_pairs":[(3, 3), (4, 4)]
-        # }
+
+        # --- 实验 2: 长度插值 (Length Interpolation) ---
+        # 假设: 如果模型真正学习了“算法”，它应该能解决从未见过的、介于训练数据长度“间隙”中的问题。
+        "2_Length_Interpolation": {
+            # 训练一个“有间隙”的分布：只包含1位数和4位数的问题
+            "train_pairs": [
+                (1, 2), (2, 2), (4, 4), (3, 4)
+            ],
+            # 测试模型能否填补(2,3)位数的“空隙”
+            "test_pairs":  [(2, 2), (3, 3), (2, 3)]
+        },
+
+        # --- 实验 3: 从对称到非对称的结构泛化 ---
+        # 假设: 一个只在对称问题 (d+d) 上训练的模型，可能无法泛化到结构不同的非对称问题 (d1+d2)。
+        # 这旨在揭示模型学习的是表面模式还是深层算法。
+        "3_Symmetry_To_Asymmetry_Generalization": {
+            # 训练数据仅覆盖对称问题
+            "train_pairs": [(1, 1), (2, 2), (3, 3), (4, 4)],
+            # 测试模型能否处理从未见过的非对称结构
+            "test_pairs":  [(2, 3), (1, 4)]
+        }
     }
     all_results=collections.defaultdict(dict)
 
@@ -145,13 +185,22 @@ def main():
         #生成数据
         print(f"\n{'='*20}正在为实验'{name}'生成数据{'='*20}")
         full_text_data=generate_dataset(20000, params['train_pairs'])
-        data=torch.tensor(tokenizer.encode(full_text_data), dtype=torch.long)
-        n=int(0.9*len(data))
-        train_data, val_data=data[:n], data[n:]
+        full_dataset=AdditionDataset(full_text_data, tokenizer, config.BLOCK_SIZE)
+        #划分训练和验证集
+        train_size=int(0.9*len(full_dataset))
+        val_size=len(full_dataset)-train_size
+        train_dataset, val_dataset=random_split(full_dataset, [train_size, val_size])
+        #创建DataLoader
+        train_loader=DataLoader(
+            train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True
+        )
+        val_loader=DataLoader(
+            val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True
+        )
         print("数据生成完成")
 
         #训练模型
-        trained_model=run_training(train_data, val_data, name.replace(" ", "_"))
+        trained_model=run_training(train_loader, val_loader, name.replace(" ", "_"))
 
         #评估模型
         accuracies=run_evaluation(trained_model, tokenizer, params["test_pairs"])
@@ -162,7 +211,6 @@ def main():
 
     print("\n=======所有实验完成，生成最终对比图========")
     plot_addition_accuracy_comparison(all_results)
-    print("正在生成训练和验证数据")
 
 
 if __name__ == "__main__":
